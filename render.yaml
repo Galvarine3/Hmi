@@ -3,8 +3,8 @@ services:
     name: hmivar-webservice
     runtime: node
     rootDir: webservice
-    buildCommand: npm install
-    startCommand: npm start
+    buildCommand: npm --prefix webservice install
+    startCommand: node webservice/src/index.js
     envVars:
       - key: NODE_VERSION
         value: 18
