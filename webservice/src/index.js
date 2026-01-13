@@ -60,6 +60,18 @@ app.get("/health", (req, res) => {
   res.status(200).send("ok");
 });
 
+app.get("/", (req, res) => {
+  res.status(200).json({
+    name: "hmivar-webservice",
+    status: "ok",
+    endpoints: {
+      health: "GET /health",
+      upload: "POST /upload (multipart/form-data, field: file)",
+      latest: "GET /latest (or /files/latest)"
+    }
+  });
+});
+
 app.post("/upload", upload.single("file"), (req, res) => {
   if (!isAuthorized(req)) {
     return res.status(401).json({ error: "Unauthorized" });
