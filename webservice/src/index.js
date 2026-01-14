@@ -113,14 +113,53 @@ app.get("/health/db", async (req, res) => {
   }
 });
 
+app.get("/uploads/count", async (req, res) => {
+  try {
+    await ensureDb();
+    const result = await withRetries(() => pool.query("select count(*)::bigint as count from uploads"), {
+      attempts: 3,
+      delayMs: 1000,
+    });
+    res.status(200).json({ ok: true, count: Number(result.rows[0]?.count ?? 0) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || "Failed to count uploads" });
+  }
+});
+
+app.get("/uploads/latest/meta", async (req, res) => {
+  try {
+    await ensureDb();
+    const result = await withRetries(
+      () =>
+        pool.query(
+          "select id, original_name, mimetype, size_bytes, uploaded_at, delimiter, has_header from uploads order by uploaded_at desc, id desc limit 1"
+        ),
+      { attempts: 3, delayMs: 1000 }
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "No file uploaded yet" });
+    }
+    res.status(200).json({ ok: true, latest: result.rows[0] });
+  } catch (err) {
+    if (isTransientDbError(err)) {
+      res.status(503).json({ ok: false, error: err?.message || "Database is starting up" });
+    } else {
+      res.status(500).json({ ok: false, error: err?.message || "Failed to read latest meta" });
+    }
+  }
+});
+
 app.get("/", (req, res) => {
   res.status(200).json({
     name: "hmivar-webservice",
     status: "ok",
     endpoints: {
       health: "GET /health",
+      healthDb: "GET /health/db",
       upload: "POST /upload (multipart/form-data, field: file)",
-      latest: "GET /latest (or /files/latest)"
+      latest: "GET /latest (or /files/latest)",
+      uploadsCount: "GET /uploads/count",
+      uploadsLatestMeta: "GET /uploads/latest/meta"
     }
   });
 });
