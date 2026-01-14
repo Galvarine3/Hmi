@@ -65,6 +65,21 @@ app.get("/health", (req, res) => {
   res.status(200).json({ ok: true, dbConfigured });
 });
 
+app.get("/health/db", async (req, res) => {
+  try {
+    await ensureDb();
+    await pool.query("select 1 as ok");
+    res.status(200).json({ ok: true, dbConfigured: true, dbOk: true });
+  } catch (err) {
+    res.status(200).json({
+      ok: true,
+      dbConfigured: Boolean(DATABASE_URL),
+      dbOk: false,
+      error: err?.message || "DB check failed",
+    });
+  }
+});
+
 app.get("/", (req, res) => {
   res.status(200).json({
     name: "hmivar-webservice",
