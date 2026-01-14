@@ -20,12 +20,43 @@ const pool = DATABASE_URL
 
 let dbInitPromise = null;
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientDbError(err) {
+  const msg = (err && err.message ? String(err.message) : "").toLowerCase();
+  return (
+    err?.code === "57P03" ||
+    msg.includes("database system is starting up") ||
+    msg.includes("the database system is starting up")
+  );
+}
+
+async function withRetries(fn, { attempts = 6, delayMs = 1000 } = {}) {
+  let lastErr = null;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientDbError(err) || i === attempts - 1) {
+        throw err;
+      }
+      await sleep(delayMs);
+    }
+  }
+  throw lastErr;
+}
+
 function ensureDb() {
   if (!pool) {
     throw new Error("DATABASE_URL is not set");
   }
   if (!dbInitPromise) {
-    dbInitPromise = pool.query(`
+    dbInitPromise = withRetries(
+      () =>
+        pool.query(`
       create table if not exists uploads (
         id bigserial primary key,
         original_name text not null,
@@ -36,7 +67,9 @@ function ensureDb() {
         has_header boolean not null default true,
         content text not null
       );
-    `);
+    `),
+      { attempts: 10, delayMs: 1000 }
+    );
   }
   return dbInitPromise;
 }
@@ -68,7 +101,7 @@ app.get("/health", (req, res) => {
 app.get("/health/db", async (req, res) => {
   try {
     await ensureDb();
-    await pool.query("select 1 as ok");
+    await withRetries(() => pool.query("select 1 as ok"), { attempts: 3, delayMs: 1000 });
     res.status(200).json({ ok: true, dbConfigured: true, dbOk: true });
   } catch (err) {
     res.status(200).json({
@@ -108,9 +141,13 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     const delimiter = guessDelimiterFromContent(content);
     const hasHeader = (req.body?.hasHeader ?? "true").toString().toLowerCase() !== "false";
 
-    const result = await pool.query(
-      "insert into uploads (original_name, mimetype, size_bytes, delimiter, has_header, content) values ($1, $2, $3, $4, $5, $6) returning id, uploaded_at",
-      [req.file.originalname, req.file.mimetype || "text/plain", req.file.size, delimiter, hasHeader, content]
+    const result = await withRetries(
+      () =>
+        pool.query(
+          "insert into uploads (original_name, mimetype, size_bytes, delimiter, has_header, content) values ($1, $2, $3, $4, $5, $6) returning id, uploaded_at",
+          [req.file.originalname, req.file.mimetype || "text/plain", req.file.size, delimiter, hasHeader, content]
+        ),
+      { attempts: 3, delayMs: 1000 }
     );
 
     res.status(200).json({
@@ -126,15 +163,23 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       },
     });
   } catch (err) {
-    res.status(500).json({ error: err?.message || "Upload failed" });
+    if (isTransientDbError(err)) {
+      res.status(503).json({ error: err?.message || "Database is starting up" });
+    } else {
+      res.status(500).json({ error: err?.message || "Upload failed" });
+    }
   }
 });
 
 app.get(["/latest", "/files/latest"], async (req, res) => {
   try {
     await ensureDb();
-    const result = await pool.query(
-      "select id, original_name, mimetype, size_bytes, uploaded_at, content from uploads order by uploaded_at desc, id desc limit 1"
+    const result = await withRetries(
+      () =>
+        pool.query(
+          "select id, original_name, mimetype, size_bytes, uploaded_at, content from uploads order by uploaded_at desc, id desc limit 1"
+        ),
+      { attempts: 3, delayMs: 1000 }
     );
     if (result.rowCount === 0) {
       return res.status(404).send("No file uploaded yet");
@@ -149,7 +194,11 @@ app.get(["/latest", "/files/latest"], async (req, res) => {
     }
     res.status(200).send(row.content);
   } catch (err) {
-    res.status(500).send(err?.message || "Failed to fetch latest");
+    if (isTransientDbError(err)) {
+      res.status(503).send(err?.message || "Database is starting up");
+    } else {
+      res.status(500).send(err?.message || "Failed to fetch latest");
+    }
   }
 });
 
