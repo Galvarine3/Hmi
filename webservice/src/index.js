@@ -1,34 +1,47 @@
 const express = require("express");
 const multer = require("multer");
-const fs = require("fs");
-const path = require("path");
+const { Pool } = require("pg");
 
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "..", "data");
 const UPLOAD_TOKEN = process.env.UPLOAD_TOKEN || "";
+const DATABASE_URL = process.env.DATABASE_URL || "";
 
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+const pool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl:
+        process.env.PGSSLMODE === "require" || process.env.PGSSL === "true"
+          ? { rejectUnauthorized: false }
+          : undefined,
+    })
+  : null;
+
+let dbInitPromise = null;
+
+function ensureDb() {
+  if (!pool) {
+    throw new Error("DATABASE_URL is not set");
   }
+  if (!dbInitPromise) {
+    dbInitPromise = pool.query(`
+      create table if not exists uploads (
+        id bigserial primary key,
+        original_name text not null,
+        mimetype text not null,
+        size_bytes bigint not null,
+        uploaded_at timestamptz not null default now(),
+        delimiter text not null default ',',
+        has_header boolean not null default true,
+        content text not null
+      );
+    `);
+  }
+  return dbInitPromise;
 }
 
-ensureDir(DATA_DIR);
-
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, DATA_DIR);
-  },
-  filename: function (req, file, cb) {
-    const safeOriginal = path.basename(file.originalname).replace(/\s+/g, "_");
-    const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    cb(null, `${ts}__${safeOriginal}`);
-  },
-});
-
-const upload = multer({ storage });
+const upload = multer({ storage: multer.memoryStorage() });
 
 function isAuthorized(req) {
   if (!UPLOAD_TOKEN) return true;
@@ -39,25 +52,17 @@ function isAuthorized(req) {
   return token === UPLOAD_TOKEN;
 }
 
-function metaPath() {
-  return path.join(DATA_DIR, "latest.json");
-}
-
-function writeLatestMeta(meta) {
-  fs.writeFileSync(metaPath(), JSON.stringify(meta, null, 2), "utf8");
-}
-
-function readLatestMeta() {
-  try {
-    const raw = fs.readFileSync(metaPath(), "utf8");
-    return JSON.parse(raw);
-  } catch (_) {
-    return null;
-  }
+function guessDelimiterFromContent(content) {
+  const firstLine = (content || "").split(/\r?\n/)[0] || "";
+  const commaCount = (firstLine.match(/,/g) || []).length;
+  const semicolonCount = (firstLine.match(/;/g) || []).length;
+  if (semicolonCount > commaCount) return ";";
+  return ",";
 }
 
 app.get("/health", (req, res) => {
-  res.status(200).send("ok");
+  const dbConfigured = Boolean(DATABASE_URL);
+  res.status(200).json({ ok: true, dbConfigured });
 });
 
 app.get("/", (req, res) => {
@@ -72,7 +77,7 @@ app.get("/", (req, res) => {
   });
 });
 
-app.post("/upload", upload.single("file"), (req, res) => {
+app.post("/upload", upload.single("file"), async (req, res) => {
   if (!isAuthorized(req)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -81,37 +86,56 @@ app.post("/upload", upload.single("file"), (req, res) => {
     return res.status(400).json({ error: "Missing file field 'file'" });
   }
 
-  const meta = {
-    filename: req.file.filename,
-    originalName: req.file.originalname,
-    mimetype: req.file.mimetype,
-    size: req.file.size,
-    uploadedAt: new Date().toISOString(),
-  };
+  try {
+    await ensureDb();
 
-  writeLatestMeta(meta);
-  res.status(200).json({ ok: true, latest: meta });
+    const content = req.file.buffer.toString("utf8");
+    const delimiter = guessDelimiterFromContent(content);
+    const hasHeader = (req.body?.hasHeader ?? "true").toString().toLowerCase() !== "false";
+
+    const result = await pool.query(
+      "insert into uploads (original_name, mimetype, size_bytes, delimiter, has_header, content) values ($1, $2, $3, $4, $5, $6) returning id, uploaded_at",
+      [req.file.originalname, req.file.mimetype || "text/plain", req.file.size, delimiter, hasHeader, content]
+    );
+
+    res.status(200).json({
+      ok: true,
+      latest: {
+        id: result.rows[0].id,
+        originalName: req.file.originalname,
+        mimetype: req.file.mimetype || "text/plain",
+        size: req.file.size,
+        uploadedAt: result.rows[0].uploaded_at,
+        delimiter,
+        hasHeader,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || "Upload failed" });
+  }
 });
 
-app.get(["/latest", "/files/latest"], (req, res) => {
-  const meta = readLatestMeta();
-  if (!meta || !meta.filename) {
-    return res.status(404).send("No file uploaded yet");
-  }
+app.get(["/latest", "/files/latest"], async (req, res) => {
+  try {
+    await ensureDb();
+    const result = await pool.query(
+      "select id, original_name, mimetype, size_bytes, uploaded_at, content from uploads order by uploaded_at desc, id desc limit 1"
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).send("No file uploaded yet");
+    }
 
-  const fullPath = path.join(DATA_DIR, meta.filename);
-  if (!fs.existsSync(fullPath)) {
-    return res.status(404).send("Latest file not found on disk");
+    const row = result.rows[0];
+    const originalName = row.original_name || "data.csv";
+    if ((originalName || "").toLowerCase().endsWith(".csv")) {
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    } else {
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    }
+    res.status(200).send(row.content);
+  } catch (err) {
+    res.status(500).send(err?.message || "Failed to fetch latest");
   }
-
-  const ext = path.extname(meta.originalName || meta.filename).toLowerCase();
-  if (ext === ".csv") {
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-  } else {
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  }
-
-  fs.createReadStream(fullPath).pipe(res);
 });
 
 app.listen(PORT, () => {
